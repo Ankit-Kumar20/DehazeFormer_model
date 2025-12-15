@@ -24,23 +24,27 @@ parser.add_argument('--log_dir', default='./logs/', type=str, help='path to logs
 parser.add_argument('--dataset', default='RESIDE-IN', type=str, help='dataset name')
 parser.add_argument('--exp', default='indoor', type=str, help='experiment setting')
 parser.add_argument('--gpu', default='0,1,2,3', type=str, help='GPUs used for training')
+parser.add_argument('--device', default='cpu', type=str, choices=['cpu', 'cuda'],
+					help='device to run on (cpu or cuda)')
 args = parser.parse_args()
 
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+if args.device == 'cuda':
+	os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 
-def train(train_loader, network, criterion, optimizer, scaler):
+def train(train_loader, network, criterion, optimizer, scaler, device, autocast_enabled):
 	losses = AverageMeter()
 
-	torch.cuda.empty_cache()
+	if device.type == 'cuda':
+		torch.cuda.empty_cache()
 	
 	network.train()
 
 	for batch in train_loader:
-		source_img = batch['source'].cuda()
-		target_img = batch['target'].cuda()
+		source_img = batch['source'].to(device, non_blocking=(device.type == 'cuda'))
+		target_img = batch['target'].to(device, non_blocking=(device.type == 'cuda'))
 
-		with autocast(args.no_autocast):
+		with autocast(enabled=autocast_enabled):
 			output = network(source_img)
 			loss = criterion(output, target_img)
 
@@ -54,16 +58,17 @@ def train(train_loader, network, criterion, optimizer, scaler):
 	return losses.avg
 
 
-def valid(val_loader, network):
+def valid(val_loader, network, device):
 	PSNR = AverageMeter()
 
-	torch.cuda.empty_cache()
+	if device.type == 'cuda':
+		torch.cuda.empty_cache()
 
 	network.eval()
 
 	for batch in val_loader:
-		source_img = batch['source'].cuda()
-		target_img = batch['target'].cuda()
+		source_img = batch['source'].to(device, non_blocking=(device.type == 'cuda'))
+		target_img = batch['target'].to(device, non_blocking=(device.type == 'cuda'))
 
 		with torch.no_grad():							# torch.no_grad() may cause warning
 			output = network(source_img).clamp_(-1, 1)		
@@ -76,6 +81,12 @@ def valid(val_loader, network):
 
 
 if __name__ == '__main__':
+	if args.device == 'cuda' and not torch.cuda.is_available():
+		raise RuntimeError("CUDA was requested (--device cuda) but is not available. Use --device cpu.")
+
+	device = torch.device(args.device)
+	autocast_enabled = bool(args.no_autocast) and device.type == 'cuda'
+
 	setting_filename = os.path.join('configs', args.exp, args.model+'.json')
 	if not os.path.exists(setting_filename):
 		setting_filename = os.path.join('configs', args.exp, 'default.json')
@@ -83,7 +94,9 @@ if __name__ == '__main__':
 		setting = json.load(f)
 
 	network = eval(args.model.replace('-', '_'))()
-	network = nn.DataParallel(network).cuda()
+	network = network.to(device)
+	if device.type == 'cuda' and torch.cuda.device_count() > 1:
+		network = nn.DataParallel(network)
 
 	criterion = nn.L1Loss()
 
@@ -95,7 +108,7 @@ if __name__ == '__main__':
 		raise Exception("ERROR: unsupported optimizer") 
 
 	scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=setting['epochs'], eta_min=setting['lr'] * 1e-2)
-	scaler = GradScaler()
+	scaler = GradScaler(enabled=autocast_enabled)
 
 	dataset_dir = os.path.join(args.data_dir, args.dataset)
 	train_dataset = PairLoader(dataset_dir, 'train', 'train', 
@@ -104,14 +117,14 @@ if __name__ == '__main__':
                               batch_size=setting['batch_size'],
                               shuffle=True,
                               num_workers=args.num_workers,
-                              pin_memory=True,
+                              pin_memory=(device.type == 'cuda'),
                               drop_last=True)
 	val_dataset = PairLoader(dataset_dir, 'test', setting['valid_mode'], 
 							  setting['patch_size'])
 	val_loader = DataLoader(val_dataset,
                             batch_size=setting['batch_size'],
                             num_workers=args.num_workers,
-                            pin_memory=True)
+                            pin_memory=(device.type == 'cuda'))
 
 	save_dir = os.path.join(args.save_dir, args.exp)
 	os.makedirs(save_dir, exist_ok=True)
@@ -124,14 +137,14 @@ if __name__ == '__main__':
 
 		best_psnr = 0
 		for epoch in tqdm(range(setting['epochs'] + 1)):
-			loss = train(train_loader, network, criterion, optimizer, scaler)
+			loss = train(train_loader, network, criterion, optimizer, scaler, device, autocast_enabled)
 
 			writer.add_scalar('train_loss', loss, epoch)
 
 			scheduler.step()
 
 			if epoch % setting['eval_freq'] == 0:
-				avg_psnr = valid(val_loader, network)
+				avg_psnr = valid(val_loader, network, device)
 				
 				writer.add_scalar('valid_psnr', avg_psnr, epoch)
 

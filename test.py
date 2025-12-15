@@ -20,11 +20,13 @@ parser.add_argument('--save_dir', default='./saved_models/', type=str, help='pat
 parser.add_argument('--result_dir', default='./results/', type=str, help='path to results saving')
 parser.add_argument('--dataset', default='RESIDE-IN', type=str, help='dataset name')
 parser.add_argument('--exp', default='indoor', type=str, help='experiment setting')
+parser.add_argument('--device', default='cpu', type=str, choices=['cpu', 'cuda'],
+					help='device to run on (cpu or cuda)')
 args = parser.parse_args()
 
 
-def single(save_dir):
-	state_dict = torch.load(save_dir)['state_dict']
+def single(save_dir, device):
+	state_dict = torch.load(save_dir, map_location=device)['state_dict']
 	new_state_dict = OrderedDict()
 
 	for k, v in state_dict.items():
@@ -34,11 +36,12 @@ def single(save_dir):
 	return new_state_dict
 
 
-def test(test_loader, network, result_dir):
+def test(test_loader, network, result_dir, device):
 	PSNR = AverageMeter()
 	SSIM = AverageMeter()
 
-	torch.cuda.empty_cache()
+	if device.type == 'cuda':
+		torch.cuda.empty_cache()
 
 	network.eval()
 
@@ -46,8 +49,8 @@ def test(test_loader, network, result_dir):
 	f_result = open(os.path.join(result_dir, 'results.csv'), 'w')
 
 	for idx, batch in enumerate(test_loader):
-		input = batch['source'].cuda()
-		target = batch['target'].cuda()
+		input = batch['source'].to(device, non_blocking=(device.type == 'cuda'))
+		target = batch['target'].to(device, non_blocking=(device.type == 'cuda'))
 
 		filename = batch['filename'][0]
 
@@ -86,13 +89,18 @@ def test(test_loader, network, result_dir):
 
 
 if __name__ == '__main__':
+	if args.device == 'cuda' and not torch.cuda.is_available():
+		raise RuntimeError("CUDA was requested (--device cuda) but is not available. Use --device cpu.")
+
+	device = torch.device(args.device)
+
 	network = eval(args.model.replace('-', '_'))()
-	network.cuda()
+	network.to(device)
 	saved_model_dir = os.path.join(args.save_dir, args.exp, args.model+'.pth')
 
 	if os.path.exists(saved_model_dir):
 		print('==> Start testing, current model name: ' + args.model)
-		network.load_state_dict(single(saved_model_dir))
+		network.load_state_dict(single(saved_model_dir, device))
 	else:
 		print('==> No existing trained model!')
 		exit(0)
@@ -105,4 +113,4 @@ if __name__ == '__main__':
 							 pin_memory=True)
 
 	result_dir = os.path.join(args.result_dir, args.dataset, args.model)
-	test(test_loader, network, result_dir)
+	test(test_loader, network, result_dir, device)
